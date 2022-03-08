@@ -157,17 +157,30 @@ impl<S: Connector + Write + Read + Timeout + Debug> InnerClient<S> {
             return_err!("The connection is already established", self);
         }
 
-        let mut addresses = addr.to_socket_addrs()?;
-
-        let server_addr = match addresses.next() {
-            Some(addr) => addr,
-            None => return_err!("Could not resolve hostname", self),
+        let addresses: Vec<_> = addr.to_socket_addrs()?.collect();
+        if let None = addresses.first() {
+            return_err!("Could not resolve hostname", self)
         };
 
-        debug!("connecting to {}", server_addr);
+        let mut last_error = None;
+        for server_addr in addresses {
+            debug!("connecting to {:?}", server_addr);
 
-        // Try to connect
-        self.set_stream(Connector::connect(&server_addr, tls_parameters)?);
+            // Try to connect
+            let result = Connector::connect(&server_addr, tls_parameters);
+            match result {
+                Ok(v) => {
+                    last_error = None;
+                    self.set_stream(v);
+                },
+                Err(err) => {
+                    last_error = Some(err);
+                },
+            }
+        }
+        if let Some(error) = last_error {
+            return Err(error)?;
+        }
 
         self.read_response()
     }

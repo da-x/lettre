@@ -85,7 +85,7 @@ pub struct SmtpClient {
     /// Credentials
     credentials: Option<Credentials>,
     /// Socket we are connecting to
-    server_addr: SocketAddr,
+    server_addrs: Vec<SocketAddr>,
     /// TLS security configuration
     security: ClientSecurity,
     /// Enable UTF8 mailboxes in envelope or headers
@@ -110,11 +110,13 @@ impl SmtpClient {
     ///
     /// Consider using [`SmtpClient::new_simple`] instead, if possible.
     pub fn new<A: ToSocketAddrs>(addr: A, security: ClientSecurity) -> Result<SmtpClient, Error> {
-        let mut addresses = addr.to_socket_addrs()?;
+        let server_addrs: Vec<_> = addr.to_socket_addrs()?.collect();
+        if let None = server_addrs.first() {
+            return Err(Error::Resolution);
+        };
 
-        match addresses.next() {
-            Some(addr) => Ok(SmtpClient {
-                server_addr: addr,
+        Ok(SmtpClient {
+                server_addrs,
                 security,
                 smtp_utf8: false,
                 credentials: None,
@@ -122,9 +124,7 @@ impl SmtpClient {
                 hello_name: ClientId::hostname(),
                 authentication_mechanism: None,
                 timeout: Some(Duration::new(60, 0)),
-            }),
-            None => Err(Error::Resolution),
-        }
+        })
     }
 
     /// Simple and secure transport, should be used when possible.
@@ -257,23 +257,48 @@ impl<'a> SmtpTransport {
         if self.state.connection_reuse_count > 0 {
             info!(
                 "connection already established to {}",
-                self.client_info.server_addr
+                self.client_info.server_addrs.first().unwrap()
             );
             return Ok(());
         }
 
-        self.client.connect(
-            &self.client_info.server_addr,
-            match self.client_info.security {
-                ClientSecurity::Wrapper(ref tls_parameters) => Some(tls_parameters),
-                _ => None,
-            },
-        )?;
+        let mut last_error = None;
+        for _ in 0..self.client_info.server_addrs.len() {
+            let server_addr = self.client_info.server_addrs.first().unwrap();
+            debug!("connecting to {:?}", server_addr);
+
+            // Try to connect
+            let result = self.client.connect(
+                &self.client_info.server_addrs.first().unwrap(),
+                match self.client_info.security {
+                    ClientSecurity::Wrapper(ref tls_parameters) => Some(tls_parameters),
+                    _ => None,
+                },
+            );
+
+            match result {
+                Ok(_) => {
+                    last_error = None;
+                    break;
+                },
+                Err(err) => {
+                    last_error = Some(err);
+                },
+            }
+
+            // Rotate addresses in client info
+            let failed = self.client_info.server_addrs.remove(0);
+            self.client_info.server_addrs.push(failed);
+        }
+
+        if let Some(error) = last_error {
+            return Err(error)?;
+        }
 
         self.client.set_timeout(self.client_info.timeout)?;
 
         // Log the connection
-        info!("connection established to {}", self.client_info.server_addr);
+        info!("connection established to {}", self.client_info.server_addrs.first().unwrap());
 
         self.ehlo()?;
 
